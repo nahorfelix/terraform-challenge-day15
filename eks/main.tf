@@ -66,12 +66,17 @@ module "eks" {
   subnet_ids                     = module.vpc.private_subnets
   cluster_endpoint_public_access = true
 
+  # Grant the IAM identity that runs terraform full admin access to the cluster
+  enable_cluster_creator_admin_permissions = true
+
   eks_managed_node_groups = {
     default = {
       min_size       = 1
       max_size       = 3
       desired_size   = 2
       instance_types = ["t3.small"]
+      # Use Spot instances — separate vCPU quota from On-Demand, significantly cheaper
+      capacity_type  = "SPOT"
 
       labels = {
         Environment = "dev"
