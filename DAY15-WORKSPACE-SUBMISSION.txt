@@ -1,0 +1,117 @@
+DAY 15 WORKSPACE SUBMISSION — Multiple Providers Part 2 | Felix Nahor
+=================================================================
+
+SECTION 1 — MULTI-PROVIDER MODULE PATTERN
+----------------------------------------------------------------------
+# modules/multi-region-app/versions.tf
+terraform {
+  required_providers {
+    aws = { source = "hashicorp/aws"; version = "~> 5.0"
+      configuration_aliases = [aws.primary, aws.replica] }
+  }
+}  # No provider blocks inside the module.
+
+# Root: live/main.tf
+provider "aws" { alias = "primary"; region = "us-east-1" }
+provider "aws" { alias = "replica"; region = "us-west-2" }
+module "multi_region_app" {
+  source = "../modules/multi-region-app"; app_name = var.app_name
+  providers = { aws.primary = aws.primary; aws.replica = aws.replica }
+}
+
+Why modules cannot define their own providers:
+Aliased providers must be root-owned. A module's own provider block conflicts
+with same-aliased providers elsewhere and breaks lifecycle ordering.
+
+
+SECTION 2 — DOCKER DEPLOYMENT
+----------------------------------------------------------------------
+provider "docker" {}
+
+resource "docker_image" "nginx" { name = "nginx:latest"; keep_locally = false }
+resource "docker_container" "nginx" {
+  image = docker_image.nginx.image_id; name = "terraform-nginx"
+  ports { internal = 80; external = 8090 }
+}
+
+docker ps: terraform-nginx  Up ~1 hour  0.0.0.0:8090->80/tcp
+HTTP check: StatusCode 200  |  terraform output: nginx_url="http://localhost:8090"
+
+
+SECTION 3 — EKS CLUSTER + KUBERNETES PROVIDER
+----------------------------------------------------------------------
+provider "kubernetes" {
+  host = module.eks.cluster_endpoint
+  cluster_ca_certificate = base64decode(module.eks.cluster_certificate_authority_data)
+  exec { api_version = "client.authentication.k8s.io/v1beta1"
+    command = "aws"; args = ["eks","get-token","--cluster-name",module.eks.cluster_name] }
+}
+
+module "eks" {
+  source = "terraform-aws-modules/eks/aws"; version = "~> 20.0"
+  cluster_name = var.cluster_name; cluster_version = "1.29"
+  vpc_id = module.vpc.vpc_id; subnet_ids = module.vpc.private_subnets
+  cluster_endpoint_public_access = true
+  enable_cluster_creator_admin_permissions = true
+  eks_managed_node_groups = { default = {
+    min_size=1; max_size=3; desired_size=2
+    instance_types=["t3.small"]; capacity_type="SPOT" } }
+}
+
+exec block: runs `aws eks get-token` → STS returns short-lived bearer token
+(~15 min) → injected into every Kubernetes API request Authorization header.
+CA certificate validates the server. No long-lived credentials stored.
+
+
+SECTION 4 — KUBERNETES DEPLOYMENT CONFIRMATION
+----------------------------------------------------------------------
+kubectl get nodes:
+ip-10-0-1-4.ec2.internal    Ready  <none>  5m18s  v1.29.15-eks-ecaa3a6
+ip-10-0-2-160.ec2.internal  Ready  <none>  5m19s  v1.29.15-eks-ecaa3a6
+
+kubectl get pods -n default:
+nginx-deployment-5959df789d-5p4qm  1/1  Running  0  93s
+nginx-deployment-5959df789d-ks665  1/1  Running  0  93s
+
+nginx-service  ClusterIP  172.20.86.43  80/TCP
+63 resources destroyed after verification (terraform destroy).
+
+
+SECTION 5 — CHAPTER 7 LEARNINGS
+----------------------------------------------------------------------
+Why modules cannot have aliased provider blocks:
+Each alias must have one configuration in the deployment. A module alias
+conflicts with the same alias elsewhere and makes the destroy graph ambiguous.
+Root module owns all provider lifecycles.
+
+configuration_aliases: Declares which aliases the module expects from its caller.
+Without it Terraform rejects the providers map. It is the module's contract.
+
+How Terraform picks the Kubernetes provider: references module.eks outputs
+directly — the graph ensures EKS exists first. exec block fetches a live token
+so k8s resources only apply once the cluster API is reachable.
+
+
+SECTION 6 — EKS COST AWARENESS
+----------------------------------------------------------------------
+Resources: control plane ($0.10/hr), 2x Spot t3.small (~$0.01/hr), NAT
+($0.045/hr), EBS, CloudWatch, VPC/IAM. Total: ~$0.16/hr = ~$3.84/day.
+terraform destroy is critical: control plane + NAT charge hourly even idle.
+Forgotten cluster = ~$27/week. Always destroy after testing.
+
+
+SECTION 7 — CHALLENGES AND FIXES
+----------------------------------------------------------------------
+1. Port 8080 blocked (Windows socket error) → changed external port to 8090.
+
+2. vCPU On-Demand limit (8) exhausted — 4x t3.micro already running.
+   Fixed: capacity_type = "SPOT" — Spot instances use a separate vCPU quota.
+
+3. Kubernetes Unauthorized — EKS v20+ uses access entries, not aws-auth.
+   Fixed: enable_cluster_creator_admin_permissions = true → creates
+   aws_eks_access_entry + AmazonEKSClusterAdminPolicy for Felix-user.
+
+4. Re-apply needed — access entry propagation delay caused first apply to fail.
+   Second terraform apply succeeded immediately.
+
+===================================================================
